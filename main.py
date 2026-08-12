@@ -18,6 +18,18 @@ INTERVALO_MUESTREO_SLEEP = 200
 MAX_BUFFER_MUESTRAS = 500
 UMBRAL_DESPERTAR = 1.3
 INTERVALO_MUESTREO_VIGILANCIA_MS = 10
+UMBRAL_IMPACTO_EMERGENCIA = 4.5
+UMBRAL_CAIDA_LIBRE_G = 0.45
+VENTANA_CAIDA_MS = 1200
+UMBRAL_IMPACTO_CAIDA_G = 2.2
+UMBRAL_CAMBIO_POSTURA_G = 0.35
+NO_RECUPERACION_CONSEC = 120
+QUIETUD_ENTRADA_FACTOR = 0.8
+QUIETUD_SALIDA_FACTOR = 1.6
+QUIETUD_TIEMPO_MIN_MS = 45000
+PRE_ALERTA_CANCELACION_HOLD_MS = 1200
+COOLDOWN_POST_CANCEL_MS = 20000
+RESCATE_HOLD_MS = 2500
 
 # --- NUEVO HARDWARE ---
 PIN_BUZZER = pin15
@@ -58,11 +70,17 @@ ESTADO_PRE_ALERTA = "PRE_ALERTA"
 ESTADO_ALARMA = "ALARMA"
 ESTADO_RESCATE = "RESCATE"
 
+# --- MODOS DE OPERACIÓN ---
+MODO_VELADOR = "VELADOR"
+MODO_WEARABLE = "WEARABLE"
+
 # --- VARIABLES GLOBALES ---
 estado_actual = ESTADO_IDLE
+modo_operacion = MODO_VELADOR
 buffer_aceleracion = []
 buffer_distancia = []
 buffer_baseline = []
+buffer_baseline_z = []
 tiempo_inicio_quietud = 0
 tiempo_quietud_acumulado = 0
 tiempo_entrada_estado = 0
@@ -74,6 +92,7 @@ peak_g_impact = 0.0
 tiempo_panic_trigger = 0
 contador_varianza = 0
 evento_disparador = None  # "impacto" o "proximidad"
+quietud_prolongada_activa = False
 
 # Cache / control de ultrasonido
 ultima_distancia_cm = None
@@ -82,10 +101,15 @@ ultimo_ultra_ms = 0
 # Control recuperación en prealerta
 contador_recuperacion_prealerta = 0
 tiempo_ultimo_beep_prealerta = 0
+tiempo_cancelacion_prealerta = 0
+cooldown_prealerta_hasta = 0
+contador_no_recuperacion = 0
 
 # Secuenciador Morse SOS
 morse_index = 0
 morse_tiempo_cambio = 0
+tiempo_rescate_combo = 0
+tiempo_caida_libre = 0
 morse_pattern = [
     (1, 150), (0, 150), (1, 150), (0, 150), (1, 150), (0, 300),
     (1, 450), (0, 150), (1, 450), (0, 150), (1, 450), (0, 300),
@@ -103,14 +127,14 @@ def now_ms():
 
 def get_g_force_raw():
     x, y, z = accelerometer.get_x(), accelerometer.get_y(), accelerometer.get_z()
-    return math.sqrt(x**2 + y**2 + z**2) / 1000.0
+    return math.sqrt(x**2 + y**2 + z**2) / 1000.0, z / 1000.0
 
 
 def get_g_force():
     global g_smooth
-    mag_raw = get_g_force_raw()
+    mag_raw, z_g = get_g_force_raw()
     g_smooth = (0.9 * g_smooth) + (0.1 * mag_raw)
-    return mag_raw, g_smooth
+    return mag_raw, g_smooth, z_g
 
 
 def medir_distancia_cm():
@@ -192,6 +216,24 @@ def gestionar_baseline(g_s):
         buffer_baseline.pop(0)
     while len(buffer_baseline) > MAX_BUFFER_MUESTRAS:
         buffer_baseline.pop(0)
+
+
+def gestionar_baseline_z(z_g):
+    ahora = now_ms()
+    buffer_baseline_z.append((ahora, abs(z_g)))
+    while buffer_baseline_z and utime.ticks_diff(ahora, buffer_baseline_z[0][0]) > 30000:
+        buffer_baseline_z.pop(0)
+    while len(buffer_baseline_z) > MAX_BUFFER_MUESTRAS:
+        buffer_baseline_z.pop(0)
+
+
+def baseline_z_actual():
+    if len(buffer_baseline_z) < 10:
+        return None
+    suma = 0.0
+    for t, z in buffer_baseline_z:
+        suma += z
+    return suma / len(buffer_baseline_z)
 
 
 def umbral_impacto_dinamico():
@@ -315,6 +357,17 @@ def sonido_suave():
     buzzer_off()
 
 
+def en_cooldown_prealerta():
+    return utime.ticks_diff(cooldown_prealerta_hasta, now_ms()) > 0
+
+
+def cambio_postura_confiable(z_g):
+    base = baseline_z_actual()
+    if base is None:
+        return False
+    return abs(abs(z_g) - base) >= UMBRAL_CAMBIO_POSTURA_G
+
+
 def tick():
     global estado_actual, es_primera_iteracion
     global tiempo_inicio_quietud, tiempo_quietud_acumulado
@@ -322,6 +375,9 @@ def tick():
     global tiempo_touch_logo_sos, morse_index, morse_tiempo_cambio
     global peak_g_impact, tiempo_panic_trigger, contador_varianza, evento_disparador
     global contador_recuperacion_prealerta, tiempo_ultimo_beep_prealerta
+    global modo_operacion, quietud_prolongada_activa, contador_no_recuperacion
+    global tiempo_cancelacion_prealerta, cooldown_prealerta_hasta, tiempo_rescate_combo
+    global tiempo_caida_libre
 
     ahora = now_ms()
 
@@ -339,9 +395,22 @@ def tick():
 
     if estado_actual == ESTADO_IDLE:
         if es_primera_iteracion:
+            display.show("V" if modo_operacion == MODO_VELADOR else "W")
+            utime.sleep_ms(450)
             display.show(Image.ASLEEP)
             es_primera_iteracion = False
             tiempo_touch_logo = 0
+
+        if button_a.was_pressed():
+            modo_operacion = MODO_VELADOR
+            display.show("V")
+            utime.sleep_ms(350)
+            display.show(Image.ASLEEP)
+        elif button_b.was_pressed():
+            modo_operacion = MODO_WEARABLE
+            display.show("W")
+            utime.sleep_ms(350)
+            display.show(Image.ASLEEP)
 
         if pin_logo.is_touched():
             if tiempo_touch_logo == 0:
@@ -374,7 +443,7 @@ def tick():
 
         utime.sleep_ms(INTERVALO_MUESTREO_SLEEP)
 
-        g_raw, _ = get_g_force()
+        g_raw, _, _ = get_g_force()
         distancia = get_distancia_cacheada(INTERVALO_ULTRA_SLEEP_MS)
         gestionar_buffer_distancia(distancia)
 
@@ -396,6 +465,7 @@ def tick():
             contador_varianza = 0
             display.show(Image.HAPPY)
             es_primera_iteracion = False
+            tiempo_caida_libre = 0
 
         if pin_logo.is_touched():
             estado_actual = ESTADO_SLEEP_WATCH
@@ -404,27 +474,43 @@ def tick():
             return
 
         utime.sleep_ms(INTERVALO_MUESTREO_VIGILANCIA_MS)
-        g_raw, g_smooth_local = get_g_force()
+        g_raw, g_smooth_local, z_g = get_g_force()
         distancia = get_distancia_cacheada(INTERVALO_ULTRA_VIG_MS)
 
         gestionar_buffer(g_smooth_local)
         gestionar_baseline(g_smooth_local)
+        gestionar_baseline_z(z_g)
         gestionar_buffer_distancia(distancia)
 
         umbral_dinamico = umbral_impacto_dinamico()
 
+        if g_raw < UMBRAL_CAIDA_LIBRE_G:
+            tiempo_caida_libre = now_ms()
+
+        evento_critico = False
         if g_raw > umbral_dinamico:
             evento_disparador = "impacto"
             peak_g_impact = g_raw
-            estado_actual = ESTADO_ANALISIS_POST_EVENTO
-            es_primera_iteracion = True
-            return
+            evento_critico = True
 
         if descenso_distancia_rapido():
             evento_disparador = "proximidad"
-            estado_actual = ESTADO_ANALISIS_POST_EVENTO
-            es_primera_iteracion = True
-            return
+            peak_g_impact = max(peak_g_impact, g_raw)
+            evento_critico = True
+
+        if modo_operacion == MODO_WEARABLE and tiempo_caida_libre != 0:
+            if utime.ticks_diff(now_ms(), tiempo_caida_libre) <= VENTANA_CAIDA_MS and g_raw >= UMBRAL_IMPACTO_CAIDA_G:
+                evento_disparador = "caida"
+                peak_g_impact = max(peak_g_impact, g_raw)
+                evento_critico = True
+            elif utime.ticks_diff(now_ms(), tiempo_caida_libre) > VENTANA_CAIDA_MS:
+                tiempo_caida_libre = 0
+
+        if evento_critico:
+            if (not en_cooldown_prealerta()) or g_raw >= UMBRAL_IMPACTO_EMERGENCIA:
+                estado_actual = ESTADO_ANALISIS_POST_EVENTO
+                es_primera_iteracion = True
+                return
 
         contador_varianza += 1
         if contador_varianza >= 50:
@@ -435,13 +521,13 @@ def tick():
                     if tiempo_inicio_quietud == 0:
                         tiempo_inicio_quietud = now_ms()
                     tiempo_quietud_acumulado = utime.ticks_diff(now_ms(), tiempo_inicio_quietud)
-                    if tiempo_quietud_acumulado > 30000:
-                        estado_actual = ESTADO_PRE_ALERTA
-                        es_primera_iteracion = True
-                        return
+                    if varianza < (T_QUIETUD_DESMAYO * QUIETUD_ENTRADA_FACTOR) and tiempo_quietud_acumulado > QUIETUD_TIEMPO_MIN_MS:
+                        quietud_prolongada_activa = True
                 else:
-                    tiempo_inicio_quietud = 0
-                    tiempo_quietud_acumulado = 0
+                    if varianza > (T_QUIETUD_DESMAYO * QUIETUD_SALIDA_FACTOR):
+                        quietud_prolongada_activa = False
+                        tiempo_inicio_quietud = 0
+                        tiempo_quietud_acumulado = 0
 
     elif estado_actual == ESTADO_ANALISIS_POST_EVENTO:
         if es_primera_iteracion:
@@ -451,9 +537,10 @@ def tick():
             tiempo_entrada_estado = now_ms()
             display.show(Image.TARGET)
             es_primera_iteracion = False
+            contador_no_recuperacion = 0
 
         utime.sleep_ms(INTERVALO_MUESTREO_VIGILANCIA_MS)
-        g_raw, g_smooth_local = get_g_force()
+        g_raw, g_smooth_local, z_g = get_g_force()
         distancia = get_distancia_cacheada(INTERVALO_ULTRA_VIG_MS)
 
         ahora_local = now_ms()
@@ -463,11 +550,32 @@ def tick():
         gestionar_buffer(g_raw)
         gestionar_buffer_distancia(distancia)
         registrar_muestra_quietud(g_smooth_local)
+        gestionar_baseline(g_smooth_local)
+        gestionar_baseline_z(z_g)
 
-        if len(buffer_quietud_post_evento) >= MIN_MUESTRAS_QUIETUD_POST_EVENTO and quietud_post_evento_confiable():
-            estado_actual = ESTADO_PRE_ALERTA
-            es_primera_iteracion = True
-            return
+        if g_smooth_local <= RECUPERACION_PRE_ALERTA_G:
+            contador_no_recuperacion += 1
+        elif contador_no_recuperacion > 0:
+            contador_no_recuperacion -= 2
+            if contador_no_recuperacion < 0:
+                contador_no_recuperacion = 0
+
+        if len(buffer_quietud_post_evento) >= MIN_MUESTRAS_QUIETUD_POST_EVENTO:
+            quietud_confirmada = quietud_post_evento_confiable()
+            no_recuperacion = contador_no_recuperacion >= NO_RECUPERACION_CONSEC
+            distancia_ok = (evento_disparador != "proximidad") or distancia_estable_post_evento()
+            wearable_ok = True
+            if modo_operacion == MODO_WEARABLE:
+                wearable_ok = cambio_postura_confiable(z_g) or peak_g_impact >= UMBRAL_IMPACTO_CAIDA_G
+
+            quietud_secundaria = quietud_prolongada_activa
+            if quietud_secundaria and no_recuperacion:
+                wearable_ok = wearable_ok or (modo_operacion == MODO_VELADOR)
+
+            if quietud_confirmada and no_recuperacion and distancia_ok and wearable_ok:
+                estado_actual = ESTADO_PRE_ALERTA
+                es_primera_iteracion = True
+                return
 
         if utime.ticks_diff(ahora_local, tiempo_entrada_estado) >= (VENTANA_ANALISIS_MIN_MS + 500):
             v_actual = calcular_varianza(buffer_aceleracion)
@@ -478,7 +586,7 @@ def tick():
             else:
                 evento_coherente = True
 
-            if v_actual < T_SILENCIO_POST_EVENTO and evento_coherente:
+            if v_actual < T_SILENCIO_POST_EVENTO and evento_coherente and contador_no_recuperacion >= NO_RECUPERACION_CONSEC:
                 estado_actual = ESTADO_PRE_ALERTA
                 es_primera_iteracion = True
             else:
@@ -496,11 +604,12 @@ def tick():
             tiempo_entrada_estado = now_ms()
             tiempo_ultimo_beep_prealerta = 0
             contador_recuperacion_prealerta = 0
+            tiempo_cancelacion_prealerta = 0
             display.show("?")
             beep_corto(80)
             es_primera_iteracion = False
 
-        g_raw, g_smooth_local = get_g_force()
+        g_raw, g_smooth_local, _ = get_g_force()
         gestionar_baseline(g_smooth_local)
 
         # Pitito de aviso durante toda la ventana de prealerta
@@ -521,7 +630,24 @@ def tick():
             return
 
         if (button_a.is_pressed() or button_b.is_pressed()) and not (button_a.is_pressed() and button_b.is_pressed()):
-            estado_actual = ESTADO_VIGILANCIA
+            if tiempo_cancelacion_prealerta == 0:
+                tiempo_cancelacion_prealerta = now_ms()
+            elif utime.ticks_diff(now_ms(), tiempo_cancelacion_prealerta) > PRE_ALERTA_CANCELACION_HOLD_MS:
+                cooldown_prealerta_hasta = utime.ticks_add(now_ms(), COOLDOWN_POST_CANCEL_MS)
+                estado_actual = ESTADO_VIGILANCIA
+                es_primera_iteracion = True
+                tiempo_cancelacion_prealerta = 0
+        else:
+            tiempo_cancelacion_prealerta = 0
+
+        if button_a.is_pressed() and button_b.is_pressed():
+            tiempo_cancelacion_prealerta = 0
+
+        if estado_actual == ESTADO_VIGILANCIA:
+            return
+
+        if g_raw >= UMBRAL_IMPACTO_EMERGENCIA:
+            estado_actual = ESTADO_ALARMA
             es_primera_iteracion = True
         elif utime.ticks_diff(now_ms(), tiempo_entrada_estado) > TIEMPO_PRE_ALERTA_MS:
             estado_actual = ESTADO_ALARMA
@@ -539,6 +665,7 @@ def tick():
                 display.clear()
                 buzzer_off()
             es_primera_iteracion = False
+            tiempo_rescate_combo = 0
 
         ahora_local = now_ms()
         if utime.ticks_diff(ahora_local, morse_tiempo_cambio) >= 0:
@@ -553,9 +680,15 @@ def tick():
                 buzzer_off()
 
         if button_a.is_pressed() and button_b.is_pressed() and pin_logo.is_touched():
-            estado_actual = ESTADO_RESCATE
-            es_primera_iteracion = True
-            buzzer_off()
+            if tiempo_rescate_combo == 0:
+                tiempo_rescate_combo = now_ms()
+            elif utime.ticks_diff(now_ms(), tiempo_rescate_combo) > RESCATE_HOLD_MS:
+                estado_actual = ESTADO_RESCATE
+                es_primera_iteracion = True
+                buzzer_off()
+                tiempo_rescate_combo = 0
+        else:
+            tiempo_rescate_combo = 0
 
     elif estado_actual == ESTADO_RESCATE:
         if es_primera_iteracion:
