@@ -2,9 +2,9 @@ from microbit import *
 import utime
 import math
 
-# ==============================================================================
+# ===============================================================================
 # 🦖 PROYECTO SAFARY V2: IMPLEMENTACIÓN DE SUPERVIVENCIA (ULTRASONIDO + BUZZER)
-# ==============================================================================
+# ===============================================================================
 
 # --- CONFIGURACIÓN DE INGENIERÍA ---
 UMBRAL_IMPACTO = 2.5
@@ -36,6 +36,15 @@ MULTIPLICADOR_IMPACTO_BASELINE = 6.0
 UMBRAL_VAR_MIN_BASELINE = 0.0002
 RECUPERACION_PRE_ALERTA_G = 1.15
 PRE_ALERTA_RECUPERACION_CONSEC = 8
+
+# --- MEJORAS DE QUIETUD POST-EVENTO ---
+MIN_MUESTRAS_QUIETUD_POST_EVENTO = 12
+MIN_TIEMPO_QUIETUD_POST_EVENTO_MS = 1200
+MIN_VARIANZA_POST_EVENTO = 0.00035
+MAX_VARIACION_POST_EVENTO_G = 0.28
+MUESTRAS_QUIETUD_CONSECUTIVAS = 4
+TOLERANCIA_RESPIRACION_G = 0.12
+TOLERANCIA_TIRITAR_G = 0.18
 
 # --- ESTADOS FSM ---
 ESTADO_IDLE = "IDLE"
@@ -78,6 +87,10 @@ morse_pattern = [
     (1, 450), (0, 150), (1, 450), (0, 150), (1, 450), (0, 300),
     (1, 150), (0, 150), (1, 150), (0, 150), (1, 150), (0, 1000)
 ]
+
+# --- MEMORIA DE QUIETUD POST-EVENTO ---
+buffer_quietud_post_evento = []
+pico_post_evento = 0.0
 
 
 def now_ms():
@@ -233,6 +246,50 @@ def distancia_estable_post_evento():
     return (max(valores) - min(valores)) <= T_ESTABILIDAD_DISTANCIA_CM
 
 
+def buffer_quietud_limpio():
+    global buffer_quietud_post_evento
+    buffer_quietud_post_evento = []
+
+
+def registrar_muestra_quietud(g_s):
+    global buffer_quietud_post_evento, pico_post_evento
+    ahora = now_ms()
+    buffer_quietud_post_evento.append((ahora, g_s))
+    if g_s > pico_post_evento:
+        pico_post_evento = g_s
+    while buffer_quietud_post_evento and utime.ticks_diff(ahora, buffer_quietud_post_evento[0][0]) > 4000:
+        buffer_quietud_post_evento.pop(0)
+    while len(buffer_quietud_post_evento) > MAX_BUFFER_MUESTRAS:
+        buffer_quietud_post_evento.pop(0)
+
+
+def quietud_post_evento_confiable():
+    if len(buffer_quietud_post_evento) < MIN_MUESTRAS_QUIETUD_POST_EVENTO:
+        return False
+
+    valores = []
+    for t, g in buffer_quietud_post_evento:
+        valores.append(g)
+
+    varianza = calcular_varianza(buffer_quietud_post_evento)
+    amplitud = max(valores) - min(valores)
+    minimo = min(valores)
+    maximo = max(valores)
+
+    if varianza < MIN_VARIANZA_POST_EVENTO and amplitud <= MAX_VARIACION_POST_EVENTO_G:
+        return True
+
+    # Filtro más tolerante: quietud real con micro-movimientos como respiración/tiritar
+    if varianza < (MIN_VARIANZA_POST_EVENTO * 1.8) and amplitud <= (MAX_VARIACION_POST_EVENTO_G + TOLERANCIA_RESPIRACION_G):
+        return True
+
+    # Si el pico fue fuerte y luego el cuerpo quedó oscilando poco, también lo tomamos como quietud
+    if pico_post_evento >= 2.0 and varianza < (MIN_VARIANZA_POST_EVENTO * 2.4) and (maximo - minimo) <= (MAX_VARIACION_POST_EVENTO_G + TOLERANCIA_TIRITAR_G):
+        return True
+
+    return False
+
+
 def buzzer_on():
     PIN_BUZZER.write_digital(1)
 
@@ -257,7 +314,7 @@ def tick():
     global tiempo_entrada_estado, buffer_aceleracion, buffer_distancia, tiempo_touch_logo
     global tiempo_touch_logo_sos, morse_index, morse_tiempo_cambio
     global peak_g_impact, tiempo_panic_trigger, contador_varianza, evento_disparador
-    global contador_recuperacion_prealerta
+    global contador_recuperacion_prealerta, pico_post_evento
 
     ahora = now_ms()
 
@@ -383,12 +440,14 @@ def tick():
         if es_primera_iteracion:
             buffer_aceleracion = []
             buffer_distancia = []
+            buffer_quietud_limpio()
+            pico_post_evento = 0.0
             tiempo_entrada_estado = now_ms()
             display.show(Image.TARGET)
             es_primera_iteracion = False
 
         utime.sleep_ms(INTERVALO_MUESTREO_VIGILANCIA_MS)
-        g_raw, _ = get_g_force()
+        g_raw, g_smooth_local = get_g_force()
         distancia = get_distancia_cacheada(INTERVALO_ULTRA_VIG_MS)
 
         ahora_local = now_ms()
@@ -398,7 +457,14 @@ def tick():
         gestionar_buffer(g_raw)
         gestionar_buffer_distancia(distancia)
 
-        ahora_local = now_ms()
+        registrar_muestra_quietud(g_smooth_local)
+
+        if len(buffer_quietud_post_evento) >= MIN_MUESTRAS_QUIETUD_POST_EVENTO:
+            if quietud_post_evento_confiable():
+                estado_actual = ESTADO_PRE_ALERTA
+                es_primera_iteracion = True
+                return
+
         if utime.ticks_diff(ahora_local, tiempo_entrada_estado) >= (VENTANA_ANALISIS_MIN_MS + 500):
             v_actual = calcular_varianza(buffer_aceleracion)
             distancia_estable = distancia_estable_post_evento()
