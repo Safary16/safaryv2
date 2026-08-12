@@ -42,9 +42,12 @@ MIN_MUESTRAS_QUIETUD_POST_EVENTO = 12
 MIN_TIEMPO_QUIETUD_POST_EVENTO_MS = 1200
 MIN_VARIANZA_POST_EVENTO = 0.00035
 MAX_VARIACION_POST_EVENTO_G = 0.28
-MUESTRAS_QUIETUD_CONSECUTIVAS = 4
 TOLERANCIA_RESPIRACION_G = 0.12
 TOLERANCIA_TIRITAR_G = 0.18
+
+# --- PREALERTA: AVISO SUAVE PERIÓDICO ---
+PRE_ALERTA_BEEP_INTERVALO_MS = 2500
+PRE_ALERTA_BEEP_DURACION_MS = 80
 
 # --- ESTADOS FSM ---
 ESTADO_IDLE = "IDLE"
@@ -78,6 +81,7 @@ ultimo_ultra_ms = 0
 
 # Control recuperación en prealerta
 contador_recuperacion_prealerta = 0
+tiempo_ultimo_beep_prealerta = 0
 
 # Secuenciador Morse SOS
 morse_index = 0
@@ -198,7 +202,6 @@ def umbral_impacto_dinamico():
     var_base = calcular_varianza(buffer_baseline)
     if var_base < UMBRAL_VAR_MIN_BASELINE:
         var_base = UMBRAL_VAR_MIN_BASELINE
-    # Aproximación: si la varianza basal sube, exigimos más delta sobre 1g
     delta = math.sqrt(var_base) * MULTIPLICADOR_IMPACTO_BASELINE
     umbral = 1.0 + delta
     if umbral < UMBRAL_IMPACTO:
@@ -247,8 +250,9 @@ def distancia_estable_post_evento():
 
 
 def buffer_quietud_limpio():
-    global buffer_quietud_post_evento
+    global buffer_quietud_post_evento, pico_post_evento
     buffer_quietud_post_evento = []
+    pico_post_evento = 0.0
 
 
 def registrar_muestra_quietud(g_s):
@@ -273,18 +277,15 @@ def quietud_post_evento_confiable():
 
     varianza = calcular_varianza(buffer_quietud_post_evento)
     amplitud = max(valores) - min(valores)
-    minimo = min(valores)
     maximo = max(valores)
 
     if varianza < MIN_VARIANZA_POST_EVENTO and amplitud <= MAX_VARIACION_POST_EVENTO_G:
         return True
 
-    # Filtro más tolerante: quietud real con micro-movimientos como respiración/tiritar
     if varianza < (MIN_VARIANZA_POST_EVENTO * 1.8) and amplitud <= (MAX_VARIACION_POST_EVENTO_G + TOLERANCIA_RESPIRACION_G):
         return True
 
-    # Si el pico fue fuerte y luego el cuerpo quedó oscilando poco, también lo tomamos como quietud
-    if pico_post_evento >= 2.0 and varianza < (MIN_VARIANZA_POST_EVENTO * 2.4) and (maximo - minimo) <= (MAX_VARIACION_POST_EVENTO_G + TOLERANCIA_TIRITAR_G):
+    if pico_post_evento >= 2.0 and varianza < (MIN_VARIANZA_POST_EVENTO * 2.4) and amplitud <= (MAX_VARIACION_POST_EVENTO_G + TOLERANCIA_TIRITAR_G):
         return True
 
     return False
@@ -296,6 +297,12 @@ def buzzer_on():
 
 def buzzer_off():
     PIN_BUZZER.write_digital(0)
+
+
+def beep_corto(duracion_ms=80):
+    buzzer_on()
+    utime.sleep_ms(duracion_ms)
+    buzzer_off()
 
 
 def sonido_suave():
@@ -314,7 +321,7 @@ def tick():
     global tiempo_entrada_estado, buffer_aceleracion, buffer_distancia, tiempo_touch_logo
     global tiempo_touch_logo_sos, morse_index, morse_tiempo_cambio
     global peak_g_impact, tiempo_panic_trigger, contador_varianza, evento_disparador
-    global contador_recuperacion_prealerta, pico_post_evento
+    global contador_recuperacion_prealerta, tiempo_ultimo_beep_prealerta
 
     ahora = now_ms()
 
@@ -441,7 +448,6 @@ def tick():
             buffer_aceleracion = []
             buffer_distancia = []
             buffer_quietud_limpio()
-            pico_post_evento = 0.0
             tiempo_entrada_estado = now_ms()
             display.show(Image.TARGET)
             es_primera_iteracion = False
@@ -456,14 +462,12 @@ def tick():
 
         gestionar_buffer(g_raw)
         gestionar_buffer_distancia(distancia)
-
         registrar_muestra_quietud(g_smooth_local)
 
-        if len(buffer_quietud_post_evento) >= MIN_MUESTRAS_QUIETUD_POST_EVENTO:
-            if quietud_post_evento_confiable():
-                estado_actual = ESTADO_PRE_ALERTA
-                es_primera_iteracion = True
-                return
+        if len(buffer_quietud_post_evento) >= MIN_MUESTRAS_QUIETUD_POST_EVENTO and quietud_post_evento_confiable():
+            estado_actual = ESTADO_PRE_ALERTA
+            es_primera_iteracion = True
+            return
 
         if utime.ticks_diff(ahora_local, tiempo_entrada_estado) >= (VENTANA_ANALISIS_MIN_MS + 500):
             v_actual = calcular_varianza(buffer_aceleracion)
@@ -490,13 +494,19 @@ def tick():
     elif estado_actual == ESTADO_PRE_ALERTA:
         if es_primera_iteracion:
             tiempo_entrada_estado = now_ms()
+            tiempo_ultimo_beep_prealerta = 0
             contador_recuperacion_prealerta = 0
             display.show("?")
-            sonido_suave()
+            beep_corto(80)
             es_primera_iteracion = False
 
         g_raw, g_smooth_local = get_g_force()
         gestionar_baseline(g_smooth_local)
+
+        # Pitito de aviso durante toda la ventana de prealerta
+        if tiempo_ultimo_beep_prealerta == 0 or utime.ticks_diff(now_ms(), tiempo_ultimo_beep_prealerta) >= PRE_ALERTA_BEEP_INTERVALO_MS:
+            beep_corto(PRE_ALERTA_BEEP_DURACION_MS)
+            tiempo_ultimo_beep_prealerta = now_ms()
 
         # Si hay recuperación sostenida de movimiento, cancelamos prealerta
         if g_smooth_local > RECUPERACION_PRE_ALERTA_G:
