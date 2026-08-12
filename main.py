@@ -34,6 +34,7 @@ RESCATE_HOLD_MS = 2500
 # --- NUEVO HARDWARE ---
 PIN_BUZZER = pin15
 PIN_ULTRA_TRIG = pin13
+# IMPORTANTE: ECHO del HC-SR04 debe entrar a 3.3V (usar divisor/adaptador de nivel).
 PIN_ULTRA_ECHO = pin14
 UMBRAL_DISTANCIA_CERCANA_CM = 70
 UMBRAL_DESCENSO_RAPIDO_CM = 25
@@ -175,11 +176,11 @@ def medir_distancia_robusta_cm(intentos=3):
     return vals[len(vals) // 2]
 
 
-def get_distancia_cacheada(intervalo_ms):
+def get_distancia_cacheada(intervalo_ms, intentos=3):
     global ultimo_ultra_ms, ultima_distancia_cm
     ahora = now_ms()
     if utime.ticks_diff(ahora, ultimo_ultra_ms) >= intervalo_ms:
-        d = medir_distancia_robusta_cm()
+        d = medir_distancia_robusta_cm(intentos)
         ultimo_ultra_ms = ahora
         if d is not None:
             ultima_distancia_cm = d
@@ -368,6 +369,36 @@ def cambio_postura_confiable(z_g):
     return abs(abs(z_g) - base) >= UMBRAL_CAMBIO_POSTURA_G
 
 
+def limpiar_memoria_evento():
+    global buffer_aceleracion, buffer_distancia, buffer_baseline_z
+    global tiempo_inicio_quietud, tiempo_quietud_acumulado, quietud_prolongada_activa
+    global contador_no_recuperacion, tiempo_caida_libre
+    buffer_aceleracion = []
+    buffer_distancia = []
+    buffer_baseline_z = []
+    buffer_quietud_limpio()
+    tiempo_inicio_quietud = 0
+    tiempo_quietud_acumulado = 0
+    quietud_prolongada_activa = False
+    contador_no_recuperacion = 0
+    tiempo_caida_libre = 0
+
+
+def iniciar_analisis_post_evento(disparador, g_impacto):
+    global estado_actual, es_primera_iteracion, evento_disparador, peak_g_impact
+    evento_disparador = disparador
+    peak_g_impact = g_impacto
+    estado_actual = ESTADO_ANALISIS_POST_EVENTO
+    es_primera_iteracion = True
+    limpiar_memoria_evento()
+
+
+def proximidad_evento_confiable():
+    if modo_operacion != MODO_VELADOR:
+        return False
+    return descenso_distancia_rapido()
+
+
 def tick():
     global estado_actual, es_primera_iteracion
     global tiempo_inicio_quietud, tiempo_quietud_acumulado
@@ -416,8 +447,12 @@ def tick():
             if tiempo_touch_logo == 0:
                 tiempo_touch_logo = now_ms()
             elif utime.ticks_diff(now_ms(), tiempo_touch_logo) > 1500:
-                estado_actual = ESTADO_SLEEP_WATCH
+                if modo_operacion == MODO_WEARABLE:
+                    estado_actual = ESTADO_VIGILANCIA
+                else:
+                    estado_actual = ESTADO_SLEEP_WATCH
                 es_primera_iteracion = True
+                limpiar_memoria_evento()
                 utime.sleep_ms(500)
         else:
             tiempo_touch_logo = 0
@@ -428,7 +463,7 @@ def tick():
             display.clear()
             es_primera_iteracion = False
             tiempo_touch_logo = 0
-            buffer_distancia = []
+            limpiar_memoria_evento()
 
         if pin_logo.is_touched():
             if tiempo_touch_logo == 0:
@@ -444,25 +479,20 @@ def tick():
         utime.sleep_ms(INTERVALO_MUESTREO_SLEEP)
 
         g_raw, _, _ = get_g_force()
-        distancia = get_distancia_cacheada(INTERVALO_ULTRA_SLEEP_MS)
+        distancia = get_distancia_cacheada(INTERVALO_ULTRA_SLEEP_MS, intentos=2)
         gestionar_buffer_distancia(distancia)
 
         if g_raw > UMBRAL_DESPERTAR:
-            evento_disparador = "impacto"
-            peak_g_impact = g_raw
-            estado_actual = ESTADO_ANALISIS_POST_EVENTO
-            es_primera_iteracion = True
-        elif descenso_distancia_rapido():
-            evento_disparador = "proximidad"
-            peak_g_impact = max(peak_g_impact, g_raw)
-            estado_actual = ESTADO_ANALISIS_POST_EVENTO
-            es_primera_iteracion = True
+            iniciar_analisis_post_evento("impacto", g_raw)
+        elif proximidad_evento_confiable():
+            iniciar_analisis_post_evento("proximidad", g_raw)
 
     elif estado_actual == ESTADO_VIGILANCIA:
         if es_primera_iteracion:
             tiempo_inicio_quietud = 0
             tiempo_quietud_acumulado = 0
             contador_varianza = 0
+            quietud_prolongada_activa = False
             display.show(Image.HAPPY)
             es_primera_iteracion = False
             tiempo_caida_libre = 0
@@ -475,7 +505,7 @@ def tick():
 
         utime.sleep_ms(INTERVALO_MUESTREO_VIGILANCIA_MS)
         g_raw, g_smooth_local, z_g = get_g_force()
-        distancia = get_distancia_cacheada(INTERVALO_ULTRA_VIG_MS)
+        distancia = get_distancia_cacheada(INTERVALO_ULTRA_VIG_MS, intentos=1)
 
         gestionar_buffer(g_smooth_local)
         gestionar_baseline(g_smooth_local)
@@ -493,7 +523,7 @@ def tick():
             peak_g_impact = g_raw
             evento_critico = True
 
-        if descenso_distancia_rapido():
+        if proximidad_evento_confiable():
             evento_disparador = "proximidad"
             peak_g_impact = max(peak_g_impact, g_raw)
             evento_critico = True
@@ -508,8 +538,7 @@ def tick():
 
         if evento_critico:
             if (not en_cooldown_prealerta()) or g_raw >= UMBRAL_IMPACTO_EMERGENCIA:
-                estado_actual = ESTADO_ANALISIS_POST_EVENTO
-                es_primera_iteracion = True
+                iniciar_analisis_post_evento(evento_disparador, peak_g_impact)
                 return
 
         contador_varianza += 1
@@ -531,17 +560,13 @@ def tick():
 
     elif estado_actual == ESTADO_ANALISIS_POST_EVENTO:
         if es_primera_iteracion:
-            buffer_aceleracion = []
-            buffer_distancia = []
-            buffer_quietud_limpio()
             tiempo_entrada_estado = now_ms()
             display.show(Image.TARGET)
             es_primera_iteracion = False
-            contador_no_recuperacion = 0
 
         utime.sleep_ms(INTERVALO_MUESTREO_VIGILANCIA_MS)
         g_raw, g_smooth_local, z_g = get_g_force()
-        distancia = get_distancia_cacheada(INTERVALO_ULTRA_VIG_MS)
+        distancia = get_distancia_cacheada(INTERVALO_ULTRA_VIG_MS, intentos=1)
 
         ahora_local = now_ms()
         if utime.ticks_diff(ahora_local, tiempo_entrada_estado) < 500:
@@ -589,10 +614,13 @@ def tick():
             if v_actual < T_SILENCIO_POST_EVENTO and evento_coherente and contador_no_recuperacion >= NO_RECUPERACION_CONSEC:
                 estado_actual = ESTADO_PRE_ALERTA
                 es_primera_iteracion = True
-            else:
+                return
+
+            recuperacion_clara = v_actual > (T_SILENCIO_POST_EVENTO * 1.5) and contador_no_recuperacion < (NO_RECUPERACION_CONSEC // 3)
+            if recuperacion_clara:
                 estado_actual = ESTADO_VIGILANCIA
                 es_primera_iteracion = True
-            return
+                return
 
         if utime.ticks_diff(ahora_local, tiempo_entrada_estado) > TIMEOUT_ANALISIS_MS:
             estado_actual = ESTADO_VIGILANCIA
